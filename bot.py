@@ -1,9 +1,10 @@
-# language: Python 3.10+, file: wp2_fixed.py
-# Telegram bot — analyze, bypass, cycles, fire, txt
-# FIXES: cancel mid-job | batch send every N numbers | crash-safe partial save | faster
-# deps: requests
 
-import re, random, time, json, base64, threading
+# language: Python 3.10+, file: bot.py
+# Telegram bot — analyze, bypass, cycles, fire, txt
+# supports: testcookie-nginx (AES) + base64 JS + meta refresh + t.me rotate skip
+# deps: SIRF requests
+
+import re, random, time, json, base64
 from pathlib import Path
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,17 +12,15 @@ import requests
 
 # ================= CONFIG =================
 TG_TOKEN = "8909048499:AAEjZF1VRkLUhX_OqtOk8wmmXv1LRfdc-hA"
-ALLOWED_CHATS = {8753914631, 8565258976}
+ALLOWED_CHATS = {8753914631 , 8565258976}
 
-THREADS      = 30          # ↑ was 20 — faster parallel workers
-MAX_HOPS     = 15
-MAX_ATTEMPTS = 8
-TIMEOUT      = 10          # ↓ was 12 — tighter so slow workers don't block
-HOP_DELAY    = 0
-WORK_DIR     = Path("/sdcard/wp1")
+THREADS = 20
+MAX_HOPS = 15
+MAX_ATTEMPTS = 8          # t.me branch mile to dobara try — kitni baar
+TIMEOUT = 12
+HOP_DELAY = 0
+WORK_DIR = Path("/sdcard/wp1")
 WORK_DIR.mkdir(parents=True, exist_ok=True)
-
-BATCH_SEND_EVERY = 20      # har 20 unique numbers pe auto-send karo
 
 API = "https://api.telegram.org/bot" + TG_TOKEN
 
@@ -239,7 +238,7 @@ def bypass_testcookie(session, url, headers, resp):
     return session.get(retry_url, headers=headers, timeout=TIMEOUT, allow_redirects=False)
 
 # ================= extract =================
-WA_ME_RE    = re.compile(r"(?:wa\.me/|api\.whatsapp\.com/send/?\?phone=|web\.whatsapp\.com/send\?phone=|whatsapp\.com/send/?\?phone=)(\d{6,15})")
+WA_ME_RE = re.compile(r"(?:wa\.me/|api\.whatsapp\.com/send/?\?phone=|web\.whatsapp\.com/send\?phone=|whatsapp\.com/send/?\?phone=)(\d{6,15})")
 ANY_PHONE_RE = re.compile(r"(?:\+?91[\-\s]?)?([6-9]\d{9})\b")
 
 def extract_numbers(text):
@@ -253,32 +252,26 @@ def extract_numbers(text):
 CACHE_BUST_PARAMS = ["_r", "igshid", "fbclid", "utm_content", "v", "t", "s", "ref"]
 
 def _bust_url(url):
+    """url me random query param add karo — backend cache/routing bypass"""
     r = random.randint(100000, 9999999)
     pname = random.choice(CACHE_BUST_PARAMS)
     sep = "&" if "?" in url else "?"
     return url + sep + pname + "=" + str(r)
 
-def worker_scrape(seed_url, stop_event=None):
+def worker_scrape(seed_url, collect_log=None):
     """
-    Rotating link handling + cancel support via stop_event.
-    Returns set of found numbers. Checks stop_event each attempt.
+    Rotating link handling: t.me / telegram branch mile to skip, dobara try.
+    jab tak wa.me na mile ya MAX_ATTEMPTS khatam.
     """
     for attempt in range(MAX_ATTEMPTS):
-        # --- CANCEL CHECK ---
-        if stop_event and stop_event.is_set():
-            return set()
-
         session = make_session()
-        found   = set()
-        url     = _bust_url(seed_url)
+        found = set()
+        url = _bust_url(seed_url)
         headers = build_headers()
         visited = set()
         landed_wa = False
 
         for hop in range(MAX_HOPS):
-            if stop_event and stop_event.is_set():
-                return found  # return partial even on cancel
-
             if url in visited: break
             visited.add(url)
             try:
@@ -305,6 +298,7 @@ def worker_scrape(seed_url, stop_event=None):
                     if not tgt: continue
                     found |= extract_numbers(tgt)
                     if "t.me" in tgt or "telegram" in tgt:
+                        if collect_log is not None: collect_log.append("skip t.me (js)")
                         break  # next attempt
                     if "wa.me" in tgt or "whatsapp.com" in tgt:
                         try:
@@ -320,6 +314,7 @@ def worker_scrape(seed_url, stop_event=None):
                             loc2 = resolve_url(tgt, loc2)
                             found |= extract_numbers(loc2)
                             if "t.me" in loc2 or "telegram" in loc2:
+                                if collect_log is not None: collect_log.append("skip t.me (nested)")
                                 break
                             if "wa.me" in loc2 or "whatsapp.com" in loc2:
                                 try:
@@ -337,8 +332,10 @@ def worker_scrape(seed_url, stop_event=None):
                 loc = resolve_url(url, loc)
                 found |= extract_numbers(loc)
 
+                # rotate branch → skip, next attempt
                 if "t.me" in loc or "telegram" in loc:
-                    break  # next attempt
+                    if collect_log is not None: collect_log.append("skip t.me (http)")
+                    break
 
                 if "wa.me" in loc or "whatsapp.com" in loc:
                     try:
@@ -354,7 +351,7 @@ def worker_scrape(seed_url, stop_event=None):
 
         if landed_wa and found:
             return found
-        time.sleep(0.2 + random.random() * 0.5)  # slightly shorter delay
+        time.sleep(0.3 + random.random() * 0.7)
 
     return set()
 
@@ -424,66 +421,30 @@ def analyze_url(url):
         break
     return info
 
-# ================= run cycles (with cancel + batch send) =================
-def run_cycles(url, n, on_progress=None, on_batch=None, stop_event=None):
-    """
-    url          — seed URL
-    n            — total cycles
-    on_progress  — callback(cycle_i, total, unique_count)
-    on_batch     — callback(new_numbers_set, total_found_so_far_set)
-                   called every time BATCH_SEND_EVERY new unique numbers accumulate
-    stop_event   — threading.Event; set it to cancel mid-run
-    Returns final set of all unique numbers.
-    """
-    found       = set()          # all unique found so far
-    batch_floor = 0              # how many were there at last batch send
-
+# ================= run cycles =================
+def run_cycles(url, n, on_progress=None):
+    found = set()
     for i in range(1, n + 1):
-        if stop_event and stop_event.is_set():
-            break
-
         with ThreadPoolExecutor(max_workers=THREADS) as ex:
-            futs = [ex.submit(worker_scrape, url, stop_event) for _ in range(THREADS)]
+            futs = [ex.submit(worker_scrape, url) for _ in range(THREADS)]
             for f in as_completed(futs):
-                if stop_event and stop_event.is_set():
-                    # cancel remaining futures quickly
-                    for remaining in futs:
-                        remaining.cancel()
-                    break
-                try:
-                    new = f.result()
-                    before = len(found)
-                    found |= new
-                    after  = len(found)
-
-                    # ---- BATCH SEND CHECK ----
-                    if on_batch and after >= batch_floor + BATCH_SEND_EVERY:
-                        # which numbers are new since last batch?
-                        batch_new = found - set()   # we need delta — track separately below
-                        on_batch(found, after)
-                        batch_floor = (after // BATCH_SEND_EVERY) * BATCH_SEND_EVERY
-
-                except Exception:
-                    pass
-
+                try: found |= f.result()
+                except Exception: pass
         if on_progress:
             try: on_progress(i, n, len(found))
             except Exception: pass
-
     return found
 
 # ================= telegram api =================
 TG_SESSION = make_session()
 
 def tg(method, **kwargs):
-    for attempt in range(3):          # retry on network blip
-        try:
-            r = TG_SESSION.post(API + "/" + method, timeout=60, **kwargs)
-            return r.json()
-        except Exception as e:
-            print("[tg] " + method + " err: " + str(e))
-            if attempt < 2: time.sleep(1.5)
-    return {"ok": False}
+    try:
+        r = TG_SESSION.post(API + "/" + method, timeout=60, **kwargs)
+        return r.json()
+    except Exception as e:
+        print("[tg] " + method + " err: " + str(e))
+        return {"ok": False}
 
 def send_msg(chat_id, text, reply_markup=None):
     data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
@@ -502,16 +463,14 @@ def send_doc(chat_id, path, caption=""):
                   files={"document": (Path(path).name, f)})
 
 # ================= state =================
-# Per-chat state now also holds a stop_event for cancel
 STATE = {}
-
 CYCLES_KB = {
     "inline_keyboard": [[
-        {"text": "🚀 5",   "callback_data": "cyc:5"},
-        {"text": "🚀 10",  "callback_data": "cyc:10"},
-        {"text": "🚀 20",  "callback_data": "cyc:20"},
+        {"text": "🚀 5", "callback_data": "cyc:5"},
+        {"text": "🚀 10", "callback_data": "cyc:10"},
+        {"text": "🚀 20", "callback_data": "cyc:20"},
     ], [
-        {"text": "🚀 50",  "callback_data": "cyc:50"},
+        {"text": "🚀 50", "callback_data": "cyc:50"},
         {"text": "🚀 100", "callback_data": "cyc:100"},
     ], [
         {"text": "❌ Cancel", "callback_data": "cyc:cancel"},
@@ -522,159 +481,25 @@ def is_allowed(chat_id):
     if ALLOWED_CHATS is None: return True
     return chat_id in ALLOWED_CHATS
 
-def get_state(chat_id): return STATE.setdefault(chat_id, {"step": "idle", "url": None, "stop_event": None})
+def get_state(chat_id): return STATE.setdefault(chat_id, {"step": "idle", "url": None})
 def set_state(chat_id, **kw): get_state(chat_id).update(kw)
 
-def cancel_running_job(chat_id):
-    """Signal the running job for this chat to stop."""
-    st = get_state(chat_id)
-    ev = st.get("stop_event")
-    if ev and isinstance(ev, threading.Event):
-        ev.set()
-
-# ================= partial / crash-safe save =================
-_partial_lock = threading.Lock()
-
-def partial_save(chat_id, numbers, ts):
-    """Save numbers to a crash-safe partial file and return path."""
-    fname = "partial_" + str(chat_id) + "_" + ts + ".txt"
-    fpath = WORK_DIR / fname
-    try:
-        with _partial_lock:
-            fpath.write_text("\n".join(sorted(numbers)) + ("\n" if numbers else ""), encoding="utf-8")
-    except Exception as e:
-        print("[save] partial save err: " + str(e))
-    return fpath
-
-# ================= extraction thread =================
-def _extraction_thread(chat_id, url, n, status_id, ts):
-    """Runs in a background thread. Handles progress, batch sends, cancel, and final send."""
-    stop_event = get_state(chat_id)["stop_event"]
-    t0         = time.time()
-    last_upd   = [0]
-    batch_num  = [0]                # how many batch files sent so far
-    all_found  = set()              # track everything for partial save
-
-    def on_prog(i, total, count):
-        if stop_event.is_set(): return
-        now = time.time()
-        if now - last_upd[0] < 1.2 and i != total: return
-        last_upd[0] = now
-        pct = int(i * 100 / total)
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-        try:
-            edit_msg(chat_id, status_id,
-                "⏳ Cycle " + str(i) + "/" + str(total) + "\n"
-                + bar + " " + str(pct) + "%\n"
-                + "📊 Unique: " + str(count) + "\n"
-                + "💾 Batches sent: " + str(batch_num[0]) + "\n"
-                + "🛑 /cancel to stop")
-        except Exception: pass
-
-    def on_batch(all_numbers, count):
-        """Called every BATCH_SEND_EVERY new unique numbers."""
-        batch_num[0] += 1
-        bfname = "batch" + str(batch_num[0]) + "_" + str(chat_id) + "_" + ts + ".txt"
-        bfpath = WORK_DIR / bfname
-        nums_sorted = sorted(all_numbers)
-        try:
-            bfpath.write_text("\n".join(nums_sorted) + "\n", encoding="utf-8")
-            send_doc(chat_id, str(bfpath),
-                caption="📦 Batch #" + str(batch_num[0]) + " — " + str(count) + " unique numbers so far")
-        except Exception as e:
-            print("[batch] err: " + str(e))
-
-    # ---- CRASH-SAFE WRAPPER ----
-    try:
-        found = run_cycles(url, n,
-                           on_progress=on_prog,
-                           on_batch=on_batch,
-                           stop_event=stop_event)
-    except Exception as e:
-        # Crash! Save whatever we have
-        recovered = partial_save(chat_id, all_found, ts)
-        try:
-            edit_msg(chat_id, status_id, "⚠️ Error: " + str(e)[:180] + "\n\n💾 Partial save in progress...")
-            if all_found:
-                send_doc(chat_id, str(recovered),
-                    caption="⚠️ Crash recovery — " + str(len(all_found)) + " numbers saved")
-            else:
-                send_msg(chat_id, "⚠️ Crashed, 0 numbers collected before crash.")
-        except Exception: pass
-        set_state(chat_id, step="idle", stop_event=None)
-        return
-
-    # ---- DONE or CANCELLED ----
-    elapsed = round(time.time() - t0, 1)
-    numbers = sorted(found)
-    cancelled = stop_event.is_set()
-
-    # Final file (always save)
-    suffix   = "_cancelled" if cancelled else ""
-    fname    = "whatsapp_numbers_" + str(chat_id) + "_" + ts + suffix + ".txt"
-    fpath    = WORK_DIR / fname
-    try:
-        fpath.write_text("\n".join(numbers) + ("\n" if numbers else ""), encoding="utf-8")
-    except Exception as e:
-        print("[save] final save err: " + str(e))
-
-    status_txt = (
-        ("⛔ *Cancelled!*" if cancelled else "✅ *Extraction Complete!*") + "\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "🔄 Cycles: " + (str(n) if not cancelled else "stopped early") + "\n"
-        "🧵 Threads: " + str(THREADS) + " × " + str(MAX_ATTEMPTS) + " attempts\n"
-        "📊 Unique: " + str(len(numbers)) + "\n"
-        "📦 Batches sent: " + str(batch_num[0]) + "\n"
-        "⏱️ Time: " + str(elapsed) + "s\n"
-        "━━━━━━━━━━━━━━━━"
-    )
-    try:
-        edit_msg(chat_id, status_id, status_txt)
-    except Exception: pass
-
-    # Send final file only if we have numbers AND no batch was sent yet
-    # (if batches were sent, user already has all numbers)
-    if numbers and batch_num[0] == 0:
-        try:
-            send_doc(chat_id, str(fpath),
-                caption="📁 " + str(len(numbers)) + " unique" + (" (cancelled)" if cancelled else ""))
-        except Exception as e:
-            print("[doc] " + str(e))
-    elif numbers and batch_num[0] > 0:
-        # Send a final consolidated file too
-        try:
-            send_doc(chat_id, str(fpath),
-                caption="📁 Final: " + str(len(numbers)) + " unique total" + (" (cancelled)" if cancelled else ""))
-        except Exception: pass
-    elif not numbers:
-        send_msg(chat_id, "😶 Koi number nahi mila" + (" (cancelled)" if cancelled else ""))
-
-    set_state(chat_id, step="await_link", url=None, stop_event=None)
-
-# ================= handlers =================
 def handle_text(chat_id, text, msg_id):
     if not is_allowed(chat_id): send_msg(chat_id, "❌ not allowed"); return
     text = text.strip()
-    st   = get_state(chat_id)
+    st = get_state(chat_id)
 
     if text in ("/start", "menu"):
-        cancel_running_job(chat_id)
-        set_state(chat_id, step="await_link", url=None, stop_event=None)
+        set_state(chat_id, step="await_link", url=None)
         send_msg(chat_id,
             "🤖 *Number Extractor Bot*\n\n"
             "link bhej — analyze → cycles → fire → txt\n\n"
-            "commands: /cancel /stats\n"
-            "⚡ Auto-sends every " + str(BATCH_SEND_EVERY) + " numbers found")
+            "commands: /cancel /stats")
         return
 
     if text in ("/cancel", "cancel"):
-        if st.get("step") == "running":
-            cancel_running_job(chat_id)
-            send_msg(chat_id, "⛔ Cancelling... numbers collected so far bhej dega")
-        else:
-            set_state(chat_id, step="idle", url=None)
-            send_msg(chat_id, "❌ cancelled")
-        return
+        set_state(chat_id, step="idle", url=None)
+        send_msg(chat_id, "❌ cancelled"); return
 
     if text == "/stats":
         n = 0
@@ -684,16 +509,10 @@ def handle_text(chat_id, text, msg_id):
 
     m = re.match(r"https?://\S+", text)
     if m:
-        if st.get("step") == "running":
-            send_msg(chat_id, "⏳ Job chal raha hai. /cancel karo pehle."); return
         url = m.group(0)
         set_state(chat_id, step="analyzing", url=url)
         send_msg(chat_id, "🔍 *Analyzing...*\n\n`" + url[:120] + "`")
-        try:
-            info = analyze_url(url)
-        except Exception as e:
-            send_msg(chat_id, "❌ Analyze error: " + str(e)[:150])
-            set_state(chat_id, step="await_link"); return
+        info = analyze_url(url)
         chain_txt = "\n".join("  " + c for c in info["chain"][:8]) or "  (none)"
         note_line = ("\n⚠️ " + info["note"] + " link detected") if info.get("note") else ""
         txt = (
@@ -726,13 +545,8 @@ def handle_callback(chat_id, data, msg_id):
     if not data.startswith("cyc:"): return
     val = data.split(":", 1)[1]
     if val == "cancel":
-        if st.get("step") == "running":
-            cancel_running_job(chat_id)
-            edit_msg(chat_id, msg_id, "⛔ Cancelling...")
-        else:
-            set_state(chat_id, step="idle", url=None)
-            edit_msg(chat_id, msg_id, "❌ cancelled")
-        return
+        set_state(chat_id, step="idle", url=None)
+        edit_msg(chat_id, msg_id, "❌ cancelled"); return
     if st["step"] != "await_cycles" or not st.get("url"):
         edit_msg(chat_id, msg_id, "pehle link bhej"); return
     n = int(val)
@@ -740,25 +554,56 @@ def handle_callback(chat_id, data, msg_id):
     start_extraction(chat_id, st["url"], n)
 
 def start_extraction(chat_id, url, n):
-    stop_event = threading.Event()
-    set_state(chat_id, step="running", stop_event=stop_event)
-
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    set_state(chat_id, step="running")
     status = send_msg(chat_id,
         "⏳ *Starting extraction...*\n\n"
         "Cycles: " + str(n) + "\n"
         "Threads: " + str(THREADS) + "\n"
-        "Auto-batch: every " + str(BATCH_SEND_EVERY) + " numbers\n"
-        "🛑 /cancel to stop anytime")
+        "Attempts/worker: " + str(MAX_ATTEMPTS))
     status_id = status.get("result", {}).get("message_id")
+    t0 = time.time()
+    last_upd = [0]
 
-    # Run in background thread so polling loop is not blocked
-    t = threading.Thread(
-        target=_extraction_thread,
-        args=(chat_id, url, n, status_id, ts),
-        daemon=True
-    )
-    t.start()
+    def on_prog(i, total, count):
+        now = time.time()
+        if now - last_upd[0] < 1.0 and i != total: return
+        last_upd[0] = now
+        pct = int(i * 100 / total)
+        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        edit_msg(chat_id, status_id,
+            "⏳ Cycle " + str(i) + "/" + str(total) + "\n"
+            + bar + " " + str(pct) + "%\n"
+            + "📊 Unique: " + str(count))
+
+    try:
+        found = run_cycles(url, n, on_progress=on_prog)
+    except Exception as e:
+        edit_msg(chat_id, status_id, "❌ error: " + str(e)[:200])
+        set_state(chat_id, step="idle"); return
+
+    elapsed = round(time.time() - t0, 1)
+    numbers = sorted(found)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = "whatsapp_numbers_" + str(chat_id) + "_" + ts + ".txt"
+    fpath = WORK_DIR / fname
+    fpath.write_text("\n".join(numbers) + ("\n" if numbers else ""), encoding="utf-8")
+
+    edit_msg(chat_id, status_id,
+        "✅ *Extraction Complete!*\n"
+        "━━━━━━━━━━━━━━━━\n"
+        "🔄 Cycles: " + str(n) + "\n"
+        "🧵 Threads: " + str(THREADS) + " × " + str(MAX_ATTEMPTS) + " attempts\n"
+        "📊 Unique: " + str(len(numbers)) + "\n"
+        "⏱️ Time: " + str(elapsed) + "s\n"
+        "━━━━━━━━━━━━━━━━")
+
+    if numbers:
+        send_doc(chat_id, str(fpath), caption="📁 " + str(len(numbers)) + " unique")
+    else:
+        send_msg(chat_id, "😶 koi number nahi mila")
+
+    set_state(chat_id, step="await_link", url=None)
 
 # ================= polling =================
 def handle_update(u):
@@ -782,9 +627,7 @@ def poll():
     offset = 0
     while True:
         try:
-            r = TG_SESSION.get(API + "/getUpdates",
-                               params={"offset": offset, "timeout": 25},
-                               timeout=35)
+            r = TG_SESSION.get(API + "/getUpdates", params={"offset": offset, "timeout": 25}, timeout=35)
             data = r.json()
             if not data.get("ok"): time.sleep(3); continue
             for u in data.get("result", []):
