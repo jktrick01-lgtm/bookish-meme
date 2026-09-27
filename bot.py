@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 # ================= CONFIG =================
-TG_TOKEN = "8909048499:AAGrPy0MR-FEXhvLB0YVSWfUNrDACh9Iz64"
+TG_TOKEN = "8909048499:AAFzJk4nl9TIqwU7nzrWsFJM5fMuPoq2kr4"
 ALLOWED_CHATS = {8499838769, 8565258976}
 
 THREADS = 20
