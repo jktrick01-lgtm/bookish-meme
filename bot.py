@@ -10,8 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 # ================= CONFIG =================
-TG_TOKEN = "8792176808:AAGlZozX-nPzJzzaeCBT9ovFHUXUYIgt5nM"
-ALLOWED_CHATS = {1470691772, 8565258976}
+TG_TOKEN = "8909048499:AAEjZF1VRkLUhX_OqtOk8wmmXv1LRfdc-hA"
+ALLOWED_CHATS = {8753914631, 8565258976}
 
 THREADS      = 30          # ↑ was 20 — faster parallel workers
 MAX_HOPS     = 15
